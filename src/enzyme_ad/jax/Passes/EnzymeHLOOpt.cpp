@@ -1440,6 +1440,68 @@ struct LowerUpdateWithoutCorners
   }
 };
 
+static Value createInBoxCondition(OpBuilder &rewriter, Location loc,
+                                  ArrayRef<int64_t> shape,
+                                  ArrayRef<int64_t> bounds) {
+  Value condition;
+  for (int64_t dim = 0; dim < shape.size(); dim++) {
+    auto i32TensorType = RankedTensorType::get(shape, rewriter.getI32Type());
+    Value iota = stablehlo::IotaOp::create(rewriter, loc, i32TensorType, dim);
+
+    Value lb = stablehlo::ConstantOp::create(
+        rewriter, loc,
+        SplatElementsAttr::get(i32TensorType,
+                               rewriter.getI32IntegerAttr(bounds[2 * dim])));
+    Value ub = stablehlo::ConstantOp::create(
+        rewriter, loc,
+        SplatElementsAttr::get(
+            i32TensorType, rewriter.getI32IntegerAttr(bounds[2 * dim + 1])));
+
+    Value cmp1 = stablehlo::CompareOp::create(
+        rewriter, loc, iota, lb, stablehlo::ComparisonDirection::GE);
+    Value cmp2 = stablehlo::CompareOp::create(
+        rewriter, loc, iota, ub, stablehlo::ComparisonDirection::LT);
+    Value cmp = stablehlo::AndOp::create(rewriter, loc, cmp1, cmp2);
+    if (!condition) {
+      condition = cmp;
+      continue;
+    }
+    condition = stablehlo::AndOp::create(rewriter, loc, condition, cmp);
+  }
+  return condition;
+}
+
+struct LowerPiecewiseSelect
+    : public CheckedOpRewritePattern<enzymexla::PiecewiseSelectOp,
+                                     LowerPiecewiseSelect> {
+  using CheckedOpRewritePattern::CheckedOpRewritePattern;
+
+  LogicalResult matchAndRewriteImpl(enzymexla::PiecewiseSelectOp op,
+                                    PatternRewriter &rewriter) const {
+    Value condition;
+    for (Attribute box : op.getBoxes()) {
+      SmallVector boxCoords = llvm::map_to_vector(
+          cast<ArrayAttr>(box).getAsValueRange<IntegerAttr>(),
+          [](APInt apInt) { return apInt.getSExtValue(); });
+      Value boxCondition = createInBoxCondition(
+          rewriter, op.getLoc(), op.getType().getShape(), boxCoords);
+      if (!condition) {
+        condition = boxCondition;
+        continue;
+      }
+      condition = stablehlo::OrOp::create(rewriter, op.getLoc(), condition,
+                                          boxCondition);
+    }
+
+    auto select =
+        stablehlo::SelectOp::create(rewriter, op.getLoc(), condition,
+                                    op.getWhenInBox(), op.getWhenOutOfBox());
+    rewriter.replaceOp(op, select);
+
+    return success();
+  }
+};
+
 // Optimization: DUSConcat
 // Pattern:
 //   %concat = stablehlo.concatenate %A, %B, %C, dimension = D
@@ -17371,6 +17433,95 @@ void computeTensorValueProvenanceImpl(
   }
 }
 
+static Value
+rematerializeByPiecewiseSelect(RewriterBase &rewriter, Location loc,
+                               ArrayRef<int64_t> expectedShape,
+                               const TensorValueProvenance &provenance) {
+  unsigned rank = expectedShape.size();
+  llvm::MapVector<int64_t, SmallVector<int64_t>> sourcePosToDisjunctIdx;
+  SmallVector<Attribute> boxes;
+  boxes.reserve(provenance.provenanceRelation.getNumDisjuncts());
+  for (auto &&[i, disjunct] :
+       llvm::enumerate(provenance.provenanceRelation.getAllDisjuncts())) {
+    std::optional<DynamicAPInt> sourcePos =
+        disjunct.getConstantBound(presburger::BoundType::EQ, rank);
+    if (!sourcePos.has_value()) {
+      return nullptr;
+    }
+
+    Value source = provenance.sources[static_cast<int64_t>(*sourcePos)];
+    auto sourceType = cast<RankedTensorType>(source.getType());
+    if (sourceType.getRank() != 0 && sourceType.getShape() != expectedShape)
+      return nullptr;
+
+    // If the source is not a broadcasted scalar, we need to check that it the
+    // mapping is identity, otherwise we cannot simply update the value.
+    // TODO: we can see whether we can then reconstruct it differently, e.g., if
+    // it is a shifted equality, we can emit a slice. The general problem is
+    // similar to "opening the polyhedral compiler black box" paper.
+    if (sourceType.getRank() != 0) {
+      auto identityRelation = presburger::IntegerRelation::getUniverse(
+          disjunct.getSpace().getSpaceWithoutLocals());
+      for (unsigned i = 0; i < rank; ++i) {
+        SmallVector<int64_t> coefficients(2 * rank + 2, 0);
+        coefficients[i] = -1;
+        coefficients[rank + i + 1] = 1;
+        identityRelation.addEquality(coefficients);
+      }
+      SmallVector<int64_t> coefficients(2 * rank + 2, 0);
+      coefficients[rank] = -1;
+      coefficients.back() = static_cast<int64_t>(*sourcePos);
+      identityRelation.addEquality(coefficients);
+      // The identity relation is not bounded unlike the disjunct, so we check
+      // for subset rather than full equality. It is also cheaper to do so.
+      if (!disjunct.isSubsetOf(identityRelation)) {
+        return nullptr;
+      }
+    }
+
+    sourcePosToDisjunctIdx[static_cast<int64_t>(*sourcePos)].push_back(i);
+
+    SmallVector<int64_t> box;
+    box.reserve(2 * rank);
+    for (unsigned i = 0; i < rank; ++i) {
+      auto lb = disjunct.getConstantBound(presburger::BoundType::LB, i);
+      auto ub = disjunct.getConstantBound(presburger::BoundType::UB, i);
+      if (!lb.has_value() || !ub.has_value()) {
+        return nullptr;
+      }
+      box.push_back(static_cast<int64_t>(*lb));
+      box.push_back(static_cast<int64_t>(*ub) + 1);
+    }
+    boxes.push_back(rewriter.getI64ArrayAttr(box));
+  }
+
+  auto materializeSource = [&](int64_t sourcePos) -> Value {
+    Value source = provenance.sources[sourcePos];
+    if (cast<RankedTensorType>(source.getType()).getRank() != 0)
+      return source;
+    return stablehlo::BroadcastOp::create(rewriter, loc, source, expectedShape);
+  };
+
+  Value current;
+  for (auto &&[sourcePos, disjuncts] : sourcePosToDisjunctIdx) {
+    Value source = materializeSource(sourcePos);
+    if (!current) {
+      current = source;
+      continue;
+    }
+    SmallVector<Attribute> sourceBoxes;
+    for (int64_t i = 0, e = boxes.size(); i < e; ++i) {
+      if (llvm::is_contained(disjuncts, i)) {
+        sourceBoxes.push_back(boxes[i]);
+      }
+    }
+    current = enzymexla::PiecewiseSelectOp::create(
+        rewriter, loc, current.getType(), source, current,
+        rewriter.getArrayAttr(sourceBoxes));
+  }
+  return current;
+}
+
 // Materialize a value given its provenance by emitting concat operations to
 // create a full value from individual chunks. It is under responsibility of the
 // caller to ensure that all values are visible at the insertion point of the
@@ -17597,39 +17748,29 @@ struct DUSDUSSubsuming
         provenanceInfo.erase(clonedSlice->getResult(0));
       }
     }
-    if (movedSlices.empty()) {
-      return failure();
-    }
 
+    bool didSomething = false;
     for (auto [oldSliceOp, newSliceOp] : movedSlices) {
       rewriter.replaceOp(oldSliceOp, newSliceOp->getResult(0));
+      didSomething = true;
     }
 
-    // TODO:
-    // If dus2 is not in anything else but dus, we can try removing it. For
-    // this, we check the provenance of the result of dus, if it only contains
-    // the operand of dus2 and padding, we can replace dus with a new one.
-
-    // But for that, we essentially need to reconstruct the value. Can we
-    // somehow see that a disjunct can be done by padding?
-
-    // How about a stupid thing: directly reconstruct the value and hope that
-    // other transformations will simplify it. Take a disjunect, find another
-    // disjunct that is adjacent to it. Adjacent means we can take a union of
-    // domains, coalesce it and obtain one disjunct. We then need to identify
-    // the dimension along which their are adjacent (in the general case, it
-    // could be an arbitrary hyperplane, but we really only deal with
-    // hyperrectangular domains here). Do this by looking at lower/upper bounds
-    // for every dimension and seeing if they differ by one. This tells us along
-    // which dimension to concat the two sources, or whether we can pad. Keep
-    // growing until done.
-
-    // auto dusProvenance = provenanceInfo.find(dus.getResult())->second;
-    // rewriter.setInsertionPoint(dus);
-    // Value rematerializedValue =
-    //     rematerializeByConcat(rewriter, dus.getLoc(), dusProvenance);
-    // rewriter.replaceOp(dus, rematerializedValue);
-    return success();
+    auto dusProvenance = provenanceInfo.find(dus.getResult())->second;
+    rewriter.setInsertionPoint(dus);
+    Value replacement = rematerializeByPiecewiseSelect(
+        rewriter, dus.getLoc(), dus.getResult().getType().getShape(),
+        dusProvenance);
+    if (replacement) {
+      rewriter.replaceOp(dus, replacement);
+      didSomething = true;
+      // TODO: this is a WORKING fallback to create a lot of concats
+      // } else {
+      //   Value rematerializedValue =
+      //       rematerializeByConcat(rewriter, dus.getLoc(), dusProvenance);
+      //   rewriter.replaceOp(dus, rematerializedValue);
+      //   didSomething = true;
+    }
+    return success(didSomething);
   }
 };
 
@@ -32768,9 +32909,8 @@ struct EnzymeHLOOptPass
     }
 
     if (passses & (2048 * 512)) {
-      patterns
-          .add<LowerRotate, LowerWrap, LowerExtend, LowerUpdateWithoutCorners>(
-              context);
+      patterns.add<LowerRotate, LowerWrap, LowerExtend,
+                   LowerUpdateWithoutCorners, LowerPiecewiseSelect>(context);
     }
 
     if (passses & (2048 * 1024)) {
